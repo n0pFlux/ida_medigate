@@ -324,23 +324,29 @@ class GccRTTIParser(RTTIParser):
 
 class MsvcRTTIParser(RTTIParser):
     # RTTI Complete Object Locator Offsets
+    RCOL_SIGNATURE = 0
     RCOL_VTBL_OFF = 4
-    RCOL_TYPE_DESCRIPTION = 12
-    RCOL_HIERARCHY_DESCRIPTION = 16
-    RCOL_SELF = 20
+    RCOL_TYPE_DESCRIPTION = 3 * 4
+    RCOL_HIERARCHY_DESCRIPTION = 4 * 4
+    RCOL_SELF = 5 * 4
 
     # RTTI Class Hierarchy Descriptor Offsets
-    RCHD_NR_ITEMS = 8
-    RCHD_BASE_ARRAY = 12
+    RCHD_SIGNATURE = 0
+    RCHD_ATTRIBUTES = 4
+    RCHD_NR_ITEMS = 2 * 4
+    RCHD_BASE_ARRAY = 3 * 4
 
     # RTTI Base Class Descriptor Offsets
     RBCD_TYPE_DESCRIPTION = 0
     RBCD_SUB_ELEMENTS = 4
-    RBCD_MEMBER_DISPLACEMENT = 8
-    RBCD_HIERARCHY_DESCRIPTION = 24
+    RBCD_MEMBER_DISPLACEMENT = 2 * 4
+    RBCD_VTABLE_DISPLACEMENT = 3 * 4
+    RBCD_DISPLACEMENT_WITHIN_VTABLE = 4 * 4
+    RBCD_ATTRIBUTES = 5 * 4
+    RBCD_HIERARCHY_DESCRIPTION = 6 * 4
 
     # RTTI Type Descriptor Offsets
-    RTD_NAME = 16
+    RTD_NAME = 2 * utils.WORD_LEN
 
     pure_virtual_name = "__cxa_pure_virtual"
 
@@ -367,7 +373,6 @@ class MsvcRTTIParser(RTTIParser):
             if func_ea:
                 rcol_ea = utils.get_ptr(ea - utils.WORD_LEN)
                 if cls.rdata_start <= rcol_ea < cls.rdata_end:
-                    logging.debug("parse_rtti_complete_object_locator(0x%x)", rcol_ea)
                     cls.build_class_type(rcol_ea)
 
                     while next_ea:
@@ -380,12 +385,12 @@ class MsvcRTTIParser(RTTIParser):
 
     @classmethod
     def build_class_type(cls, rcol_ea):
-        rtd_ea = cls.imagebase + ida_bytes.get_dword(rcol_ea + cls.RCOL_TYPE_DESCRIPTION)
+        rtd_ea = cls.get_ea(ida_bytes.get_dword(rcol_ea + cls.RCOL_TYPE_DESCRIPTION))
         name = cls.get_type_descriptor_name(rtd_ea)
         if not name:
             return
 
-        rchd_ea = cls.imagebase + ida_bytes.get_dword(rcol_ea + cls.RCOL_HIERARCHY_DESCRIPTION)
+        rchd_ea = cls.get_ea(ida_bytes.get_dword(rcol_ea + cls.RCOL_HIERARCHY_DESCRIPTION))
         if rchd_ea in cls.found_classes:
             return
 
@@ -404,33 +409,33 @@ class MsvcRTTIParser(RTTIParser):
         self.struct_id = None
         self.struct_ptr = None
 
-    def extract_rtti_info(cls):
-        nr_items = ida_bytes.get_dword(cls.rchd_ea + cls.RCHD_NR_ITEMS)
-        base_array_ea = cls.imagebase + ida_bytes.get_dword(cls.rchd_ea + cls.RCHD_BASE_ARRAY)
+    def extract_rtti_info(self):
+        nr_items = ida_bytes.get_dword(self.rchd_ea + self.RCHD_NR_ITEMS)
+        base_array_ea = self.get_ea(ida_bytes.get_dword(self.rchd_ea + self.RCHD_BASE_ARRAY))
 
         idx = 1
         while idx < nr_items:
             if idx == 200:
                 break
 
-            rbcd_ea = cls.imagebase + ida_bytes.get_dword(base_array_ea + idx*4)
+            rbcd_ea = self.get_ea(ida_bytes.get_dword(base_array_ea + idx*4))
 
-            rtd_ea = cls.imagebase + ida_bytes.get_dword(rbcd_ea + cls.RBCD_TYPE_DESCRIPTION)
-            name = cls.get_type_descriptor_name(rtd_ea)
+            rtd_ea = self.get_ea(ida_bytes.get_dword(rbcd_ea + self.RBCD_TYPE_DESCRIPTION))
+            name = self.get_type_descriptor_name(rtd_ea)
 
-            rbcd_sub_ele = ida_bytes.get_dword(rbcd_ea + cls.RBCD_SUB_ELEMENTS)
-            rbcd_mem_dis = ida_bytes.get_dword(rbcd_ea + cls.RBCD_MEMBER_DISPLACEMENT)
+            rbcd_sub_ele = ida_bytes.get_dword(rbcd_ea + self.RBCD_SUB_ELEMENTS)
+            rbcd_mem_dis = ida_bytes.get_dword(rbcd_ea + self.RBCD_MEMBER_DISPLACEMENT)
 
-            rchd_ea = cls.imagebase + ida_bytes.get_dword(rbcd_ea + cls.RBCD_HIERARCHY_DESCRIPTION)
-            if rchd_ea not in cls.found_classes:
-                cls.found_classes.add(rchd_ea)
+            rchd_ea = self.get_ea(ida_bytes.get_dword(rbcd_ea + self.RBCD_HIERARCHY_DESCRIPTION))
+            if rchd_ea not in self.found_classes:
+                self.found_classes.add(rchd_ea)
                 rtti_obj = MsvcRTTIParser(rchd_ea, name)
                 if rtti_obj:
                     rtti_obj.extract_rtti_info()
                     rtti_obj.create_structs()
                     rtti_obj.find_vtables()
 
-            cls.updated_parents.append([name, rbcd_mem_dis])
+            self.updated_parents.append([name, rbcd_mem_dis])
 
             if rbcd_sub_ele:
                 idx += rbcd_sub_ele
@@ -494,9 +499,13 @@ class MsvcRTTIParser(RTTIParser):
             vtable_offset = ida_bytes.get_dword(rcol_ea + self.RCOL_VTBL_OFF)
             
             for xref_rcol_ea in utils.get_drefs(rcol_ea):
-                # just at x64
-                if rcol_ea == self.imagebase + ida_bytes.get_dword(xref_rcol_ea):
+                # self reference just at x64
+                if (
+                    utils.WORD_LEN == 8
+                    and rcol_ea == self.get_ea(ida_bytes.get_dword(xref_rcol_ea))
+                ):
                     continue
+
                 logging.debug(
                     "self.rchd_ea: 0x%x\txref: 0x%x\trcol_ea: 0x%x\txref_rcol_ea: 0x%x\tvtable_offset: 0x%x",
                     self.rchd_ea,
@@ -534,3 +543,10 @@ class MsvcRTTIParser(RTTIParser):
             pure_virtual_name=self.pure_virtual_name,
         )
         return vtable_struct
+
+    @classmethod
+    def get_ea(cls, ea_or_offset):
+        if utils.WORD_LEN == 8:
+            return cls.imagebase + ea_or_offset
+        else:
+            return ea_or_offset
