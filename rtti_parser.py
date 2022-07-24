@@ -1,6 +1,9 @@
 import logging
 
+import ida_bytes
+import ida_nalt
 import ida_name
+import ida_segment
 import ida_struct
 import idaapi
 import idautils
@@ -314,6 +317,220 @@ class GccRTTIParser(RTTIParser):
             self.name,
             this_type,
             ignore_list=self.types,
+            pure_virtual_name=self.pure_virtual_name,
+        )
+        return vtable_struct
+
+
+class MsvcRTTIParser(RTTIParser):
+    # RTTI Complete Object Locator Offsets
+    RCOL_VTBL_OFF = 4
+    RCOL_TYPE_DESCRIPTION = 12
+    RCOL_HIERARCHY_DESCRIPTION = 16
+    RCOL_SELF = 20
+
+    # RTTI Class Hierarchy Descriptor Offsets
+    RCHD_NR_ITEMS = 8
+    RCHD_BASE_ARRAY = 12
+
+    # RTTI Base Class Descriptor Offsets
+    RBCD_TYPE_DESCRIPTION = 0
+    RBCD_SUB_ELEMENTS = 4
+    RBCD_MEMBER_DISPLACEMENT = 8
+    RBCD_HIERARCHY_DESCRIPTION = 24
+
+    # RTTI Type Descriptor Offsets
+    RTD_NAME = 16
+
+    pure_virtual_name = "__cxa_pure_virtual"
+
+    @classmethod
+    def init_parser(cls):
+        super(MsvcRTTIParser, cls).init_parser()
+        text_segment = ida_segment.get_segm_by_name('.text')
+        rdata_segment = ida_segment.get_segm_by_name('.rdata')
+
+        cls.text_start = text_segment.start_ea
+        cls.text_end = text_segment.end_ea
+        cls.rdata_start = rdata_segment.start_ea
+        cls.rdata_end = rdata_segment.end_ea
+
+        cls.imagebase = ida_nalt.get_imagebase()
+
+        cls.found_class_names = set()
+
+    @classmethod
+    def build_all(cls):
+        ea = cls.rdata_start
+        while ea < cls.rdata_end:
+            func_ea, next_ea = cpp_utils.get_vtable_line(ea)
+            if func_ea:
+                rcol_ea = utils.get_ptr(ea - utils.WORD_LEN)
+                if cls.rdata_start <= rcol_ea < cls.rdata_end:
+                    logging.debug("parse_rtti_complete_object_locator(0x%x)", rcol_ea)
+                    cls.build_class_type(rcol_ea)
+
+                    while next_ea:
+                        ea = next_ea
+                        func_ea, next_ea = cpp_utils.get_vtable_line(ea)
+                else:
+                    ea += utils.WORD_LEN
+            else:
+                ea += utils.WORD_LEN
+
+    @classmethod
+    def build_class_type(cls, rcol_ea):
+        rtd_ea = cls.imagebase + ida_bytes.get_dword(rcol_ea + cls.RCOL_TYPE_DESCRIPTION)
+        name = cls.get_type_descriptor_name(rtd_ea)
+        if not name:
+            return
+
+        rchd_ea = cls.imagebase + ida_bytes.get_dword(rcol_ea + cls.RCOL_HIERARCHY_DESCRIPTION)
+        if rchd_ea in cls.found_classes:
+            return
+
+        cls.found_classes.add(rchd_ea)
+        rtti_obj = MsvcRTTIParser(rchd_ea, name)
+        if rtti_obj:
+            rtti_obj.extract_rtti_info()
+            rtti_obj.create_structs()
+            rtti_obj.find_vtables()
+
+    def __init__(self, rchd_ea, name):
+        self.raw_parents = []
+        self.updated_parents = []
+        self.rchd_ea = rchd_ea
+        self.orig_name = self.name = name
+        self.struct_id = None
+        self.struct_ptr = None
+
+    def extract_rtti_info(cls):
+        nr_items = ida_bytes.get_dword(cls.rchd_ea + cls.RCHD_NR_ITEMS)
+        base_array_ea = cls.imagebase + ida_bytes.get_dword(cls.rchd_ea + cls.RCHD_BASE_ARRAY)
+
+        idx = 1
+        while idx < nr_items:
+            if idx == 200:
+                break
+
+            rbcd_ea = cls.imagebase + ida_bytes.get_dword(base_array_ea + idx*4)
+
+            rtd_ea = cls.imagebase + ida_bytes.get_dword(rbcd_ea + cls.RBCD_TYPE_DESCRIPTION)
+            name = cls.get_type_descriptor_name(rtd_ea)
+
+            rbcd_sub_ele = ida_bytes.get_dword(rbcd_ea + cls.RBCD_SUB_ELEMENTS)
+            rbcd_mem_dis = ida_bytes.get_dword(rbcd_ea + cls.RBCD_MEMBER_DISPLACEMENT)
+
+            rchd_ea = cls.imagebase + ida_bytes.get_dword(rbcd_ea + cls.RBCD_HIERARCHY_DESCRIPTION)
+            if rchd_ea not in cls.found_classes:
+                cls.found_classes.add(rchd_ea)
+                rtti_obj = MsvcRTTIParser(rchd_ea, name)
+                if rtti_obj:
+                    rtti_obj.extract_rtti_info()
+                    rtti_obj.create_structs()
+                    rtti_obj.find_vtables()
+
+            cls.updated_parents.append([name, rbcd_mem_dis])
+
+            if rbcd_sub_ele:
+                idx += rbcd_sub_ele
+            else:
+                idx += 1
+
+    @classmethod
+    def get_type_descriptor_name(cls, rtd_ea):
+        mangled_class_name = "??_R0" + idc.get_strlit_contents(rtd_ea + cls.RTD_NAME).decode()[1:]
+        class_name = ida_name.demangle_name(mangled_class_name, idc.INF_LONG_DN)
+        if class_name:
+            return cls.strip_class_name(class_name)
+        else:
+            logging.debug(
+                "get_type_descriptor_name(0x%x): Failed to demangle '%s'", 
+                rtd_ea, 
+                mangled_class_name
+            )
+            return None
+
+    @classmethod
+    def strip_class_name(cls, cls_name):
+        pre_dict = {"`typeinfo for": ":"}
+        words_dict = {
+            "`anonymous namespace'": "ANONYMOUS",
+            "`anonymous_namespace'": "ANONYMOUS",
+            "`RTTI Type Descriptor'": "",
+            "class" : "",
+        }
+        chars_dict = {
+            "<": "X",
+            ">": "Z",
+            "&": "A",
+            "*": "P",
+            " ": "_",
+            ",": "C",
+            "'": "U",
+            "`": "T",
+            "[": "O",
+            "]": "P",
+        }
+        for target, strip in words_dict.items():
+            cls_name = cls_name.replace(target, strip)
+        cls_name = cls_name.strip()
+        for target, strip in chars_dict.items():
+            cls_name = cls_name.replace(target, strip)
+        return cls_name
+
+    def find_vtables(self):
+        is_vtable_found = False
+        for xref in utils.get_drefs(self.rchd_ea):
+            # Check if we got a RTTI Base Class Descriptor or RTTI Complete Object Locator.
+            # The RTTI Base Class Descriptor has the base class attributes before the pointer
+            # to the rchd_ea. RTTI Complete Object Locator has an offset from the base to
+            # RTTI Type Descriptor. We need the later
+            rtd_offset = ida_bytes.get_dword(xref - 4)
+            if rtd_offset < 0x1000:
+                continue
+
+            rcol_ea = xref - self.RCOL_HIERARCHY_DESCRIPTION
+            vtable_offset = ida_bytes.get_dword(rcol_ea + self.RCOL_VTBL_OFF)
+            
+            for xref_rcol_ea in utils.get_drefs(rcol_ea):
+                # just at x64
+                if rcol_ea == self.imagebase + ida_bytes.get_dword(xref_rcol_ea):
+                    continue
+                logging.debug(
+                    "self.rchd_ea: 0x%x\txref: 0x%x\trcol_ea: 0x%x\txref_rcol_ea: 0x%x\tvtable_offset: 0x%x",
+                    self.rchd_ea,
+                    xref,
+                    rcol_ea,
+                    xref_rcol_ea,
+                    vtable_offset
+                )
+                if self.try_parse_vtable(xref_rcol_ea, vtable_offset) is not None:
+                    is_vtable_found = True
+        if not is_vtable_found:
+            logging.debug(
+                "find_vtable(%s): Couldn't find any vtable ->" " Interface!", self.name
+            )
+            if len(self.updated_parents) == 0:
+                cpp_utils.install_vtables_union(self.name)
+                pass
+
+    def try_parse_vtable(self, ea, vtable_offset):
+        functions_ea = ea + utils.WORD_LEN
+        func_ea, _ = cpp_utils.get_vtable_line(
+            functions_ea,
+            #ignore_list=self.types,
+            pure_virtual_name=self.pure_virtual_name,
+        )
+        if func_ea is None:
+            return
+        vtable_struct, this_type = self.create_vtable_struct(vtable_offset)
+        cpp_utils.update_vtable_struct(
+            functions_ea,
+            vtable_struct,
+            self.name,
+            this_type,
+            #ignore_list=self.types,
             pure_virtual_name=self.pure_virtual_name,
         )
         return vtable_struct
