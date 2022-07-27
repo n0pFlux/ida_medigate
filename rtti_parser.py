@@ -178,16 +178,25 @@ class GccRTTIParser(RTTIParser):
     @classmethod
     def init_parser(cls):
         super(GccRTTIParser, cls).init_parser()
-        cls.type_vmi = (
-            ida_name.get_name_ea(idaapi.BADADDR, cls.VMI) + cls.OFFSET_FROM_TYPEINF_SYM
-        )
-        cls.type_si = (
-            ida_name.get_name_ea(idaapi.BADADDR, cls.SI) + cls.OFFSET_FROM_TYPEINF_SYM
-        )
-        cls.type_none = (
-            ida_name.get_name_ea(idaapi.BADADDR, cls.NONE) + cls.OFFSET_FROM_TYPEINF_SYM
-        )
+        cls.type_vmi = cls.get_type_name_ea(cls.VMI) + cls.OFFSET_FROM_TYPEINF_SYM
+        cls.type_si = cls.get_type_name_ea(cls.SI) + cls.OFFSET_FROM_TYPEINF_SYM
+        cls.type_none = cls.get_type_name_ea(cls.NONE) + cls.OFFSET_FROM_TYPEINF_SYM
+
         cls.types = (cls.type_vmi, cls.type_si, cls.type_none)
+
+    @classmethod
+    def get_type_name_ea(cls, type_name):
+        ea = ida_name.get_name_ea(idaapi.BADADDR, type_name)
+        if ea != idaapi.BADADDR:
+            return ea
+
+        # The type name might contain the CXXABI version, e.g.,
+        # _ZTVN10__cxxabiv121__vmi_class_type_infoE@@CXXABI_1_3.
+        for ea, name in idautils.Names():
+            if name.startswith(type_name):
+                return ea
+
+        return idaapi.BADADDR
 
     @classmethod
     def build_all(cls):
