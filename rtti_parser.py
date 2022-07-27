@@ -384,6 +384,7 @@ class MsvcRTTIParser(RTTIParser):
                 ea += utils.WORD_LEN
 
     @classmethod
+    @utils.batchmode
     def build_class_type(cls, rcol_ea):
         rtd_ea = cls.get_ea(ida_bytes.get_dword(rcol_ea + cls.RCOL_TYPE_DESCRIPTION))
         name = cls.get_type_descriptor_name(rtd_ea)
